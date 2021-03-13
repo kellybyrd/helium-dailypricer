@@ -1,9 +1,10 @@
 #!/usr/bin/python3
 
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.parser import parse as dateparse
 
+import argparse
 import logging
 import json
 import requests
@@ -34,7 +35,7 @@ def paged_api_request(url, query_params={}):
     ret = []
     cursor = None
 
-    # "repeat-until cursor is None"
+    # repeat-until cursor is None
     while True:
         if cursor is not None:
             query_params["cursor"] = cursor
@@ -78,6 +79,8 @@ def hotspot_earnings_daily(address, start, stop):
     params = dict()
     params["max_time"] = stop
     params["min_time"] = start
+
+    log.info(f"Getting results from: {start} to {stop}")
     rewards = paged_api_request(url, params)
 
     # Use a Counter to sum up rewards by days.
@@ -93,13 +96,48 @@ def hotspot_earnings_daily(address, start, stop):
     return dict(daily)
 
 
+def arg_valid_date(s):
+    try:
+        dt = dateparse(s)
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+
+        return dt.isoformat()
+    except ValueError:
+        msg = "Not a valid iso8601 datetime: '{0}'.".format(s)
+        raise argparse.ArgumentTypeError(msg)
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
-    # TODO: add argparse to capture these params.
-    ret = hotspot_earnings_daily(address="XXXX", start="2021-01-10", stop="2021-03-13")
+    today = datetime.now().astimezone()
+    parser = argparse.ArgumentParser(
+        description="Get a daily rollup of earnings for a hotspot between a "
+        "range of timestamps. Results are in the "
+        "range [start, stop)."
+    )
+    parser.add_argument("address", help="A helium hotspot address", type=str)
+
+    parser.add_argument(
+        "--start",
+        help="Begining of time range as iso8601 string. Defaults to yesterday.",
+        default=(today - timedelta(days=1)).isoformat(),
+        type=arg_valid_date,
+    )
+    parser.add_argument(
+        "--stop",
+        help="End of time range as iso8601 string. Defaults to today.",
+        required=False,
+        default=today.isoformat(),
+        type=arg_valid_date,
+    )
+
+    args = parser.parse_args()
+    ret = hotspot_earnings_daily(args.address, args.start, args.stop)
     # TODO: Output in something more useful.
     print(json.dumps(ret, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
+
     main()
