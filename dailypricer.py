@@ -61,7 +61,7 @@ def arg_valid_date(s):
 def write_csv(data):
     writer = csv.writer(sys.stdout, dialect="unix")
     writer.writerow(["date", "hnt", "usd"])
-    for date, v in data.items():
+    for date, v in sorted(data.items()):
         writer.writerow((date, v["hnt"], v["usd"]))
 
 
@@ -90,9 +90,6 @@ def main():
 
     args = parser.parse_args()
     ret = hotspot_earnings_daily(args.address, args.start, args.stop)
-    # TODO: Output in something more useful.
-
-    print(f"Address: {args.address}")
     write_csv(ret)
 
 
