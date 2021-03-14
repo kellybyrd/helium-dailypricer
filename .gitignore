@@ -1,0 +1,3 @@
+__pycache__
+# pickle files for API caches
+*.pkl
