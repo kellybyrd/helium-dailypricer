@@ -41,7 +41,6 @@ def hotspot_earnings_daily(address, start, stop):
         price = api.oracle_price_at_block(r["block"]) / api.BONES_PER_HNT
         ret[day]["hnt"] += hnt
         ret[day]["usd"] += price * hnt
-        log.debug(f"{day} -- {hnt} {price} {price * hnt}  -- totals: {ret[day]}")
     del ret["key"]
     return ret
 

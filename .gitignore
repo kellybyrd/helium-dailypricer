@@ -1,3 +1,8 @@
 __pycache__
-# pickle files for API caches
+# pickle files
 *.pkl
+# sqlite files
+*.db
+*.sqlite
+*.sq3
+*.sql

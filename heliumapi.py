@@ -1,7 +1,7 @@
 import atexit
 import json
 import logging
-import pickle
+import sqlite3
 
 import requests
 
@@ -10,36 +10,45 @@ log = logging.getLogger(__name__)
 BONES_PER_HNT = 100000000
 API_URL = "https://api.helium.io/v1"
 
-# Cache of retrieved Helium Oracle prices at specific blocks
-_ORACLE_FILE = "oracle.pkl"
+_DB = None
+_DB_FILE = "cache.sqlite"
 
 
-def _save_oracle():
-    if len(_oracle_cache) > 0:
-        with open(_ORACLE_FILE, "wb+") as f:
-            pickle.dump(_oracle_cache, f)
+def _close_db():
+    if _DB is not None:
+        _DB.close()
 
 
-try:
-    with open(_ORACLE_FILE, "rb") as f:
-        _oracle_cache = pickle.load(f)
-except FileNotFoundError:
-    _oracle_cache = {}
+_DB = sqlite3.connect(_DB_FILE)
+cur = _DB.cursor()
+cur.execute(
+    "CREATE TABLE IF NOT EXISTS OraclePrices "
+    "(block INTEGER PRIMARY KEY, "
+    "price INTEGER DEFAULT 0)"
+)
+cur.execute(
+    "CREATE TABLE IF NOT EXISTS Rewards "
+    "(id INTEGER PRIMARY KEY, "
+    "adddress TEXT NOT NULL, "
+    "block INTEGER NOT NULL, "
+    "amount INTEGER DEFAULT 0)"
+)
 
-atexit.register(_save_oracle)
+atexit.register(_close_db)
+# END MODULE INIT
 
 
 def _api_request(url, query_params={}):
     """
     Takes a helium api URL which returns JSON and may have paged results as
-    described in the "Cursors" section here: 
+    described in the "Cursors" section here:
     https://docs.helium.com/api/blockchain/introduction
 
     Merges the "data" keys from all pages
-    
+
     Returns
     List of dicts from merged results.
-    
+
     Note: This assumes all the repsonse json has "data" and optionaly
           "cursor" top level keys. So far has been true
     """
@@ -77,18 +86,48 @@ def _api_request(url, query_params={}):
     return ret
 
 
+def _db_oracle_fetch(block):
+    """
+    Lookup the Oracle price from the db
+
+    Returns:
+    price in bones or None if it isn't in the db
+    """
+    cur = _DB.cursor()
+    cur.execute("SELECT price FROM OraclePrices WHERE block=:block", {"block": block})
+    ret = cur.fetchone()
+    if ret is not None:
+        ret = ret[0]
+
+    return ret
+
+
+def _db_oracle_put(block, price):
+    """
+    Save an Oracle price to the db. Does not handle errors (yet)
+    """
+    cur = _DB.cursor()
+    cur.execute(
+        "INSERT INTO OraclePrices VALUES " "(:block, :price)",
+        {"block": block, "price": price},
+    )
+    _DB.commit()
+
+
 def oracle_price_at_block(block):
     """
     Return the Helium API oracle price in bones at a given block
     """
-    if block in _oracle_cache:
-        log.debug(f"Cached price for block {block} is {_oracle_cache[block]}")
-        return _oracle_cache[block]
+    ret = _db_oracle_fetch(block)
+    if ret is None:
+        url = f"{API_URL}/oracle/prices/{block}"
+        ret = _api_request(url)["price"]
 
-    url = f"{API_URL}/oracle/prices/{block}"
-    ret = _api_request(url)["price"]
-    _oracle_cache[block] = ret
-    log.debug(f"Returning price for block {block} is {_oracle_cache[block]}")
+        _db_oracle_put(block, ret)
+        log.debug(f"Lookup price for block {block} is {ret}")
+    else:
+        log.debug(f"Cached price for block {block} is {ret}")
+
     return ret
 
 
