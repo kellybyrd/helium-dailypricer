@@ -2,8 +2,10 @@ import atexit
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 
 import requests
+from dateutil.parser import parse as dateparse
 
 log = logging.getLogger(__name__)
 
@@ -24,18 +26,26 @@ cur = _DB.cursor()
 cur.execute(
     "CREATE TABLE IF NOT EXISTS OraclePrices "
     "(block INTEGER PRIMARY KEY, "
-    "price INTEGER DEFAULT 0)"
+    "price INTEGER DEFAULT 0);"
 )
+
 cur.execute(
-    "CREATE TABLE IF NOT EXISTS Rewards "
-    "(id INTEGER PRIMARY KEY, "
-    "adddress TEXT NOT NULL, "
+    "CREATE TABLE IF NOT EXISTS DailyRewards ("
+    "hash TEXT PRIMARY KEY, "
+    "timestamp TEXT NOT NULL, "
+    "address TEXT NOT NULL, "
     "block INTEGER NOT NULL, "
-    "amount INTEGER DEFAULT 0)"
+    "amount INTEGER NOT NULL "
+    ");"
 )
 
 atexit.register(_close_db)
 # END MODULE INIT
+
+
+def _daterange(start_date, end_date):
+    for n in range(int((end_date - start_date).days)):
+        yield start_date + timedelta(n)
 
 
 def _api_request(url, query_params={}):
@@ -67,7 +77,6 @@ def _api_request(url, query_params={}):
             data = json.get("data")
             if type(data) is list:
                 ret.extend(data)
-                log.debug(f"Ret size is now: {len(ret)}")
                 cursor = json.get("cursor")
                 log.debug(f"New cursor is : {cursor}")
             else:
@@ -104,12 +113,56 @@ def _db_oracle_fetch(block):
 
 def _db_oracle_put(block, price):
     """
-    Save an Oracle price to the db. Does not handle errors (yet)
+    Save an Oracle price to the db. Does not yet handle errors like an existing
+    record
     """
     cur = _DB.cursor()
     cur.execute(
-        "INSERT INTO OraclePrices VALUES " "(:block, :price)",
+        "INSERT INTO OraclePrices VALUES (:block, :price)",
         {"block": block, "price": price},
+    )
+    _DB.commit()
+
+
+def _db_reward_fetch(address, start, stop):
+    """
+    TODO
+
+    Returns:
+    A list of reward records
+    """
+    ret = []
+    cur = _DB.cursor()
+    cur.execute(
+        "SELECT hash, timestamp, address, block, amount FROM DailyRewards "
+        "WHERE  address=:addr AND "
+        "timestamp BETWEEN :start AND :stop "
+        "ORDER BY timestamp ASC;",
+        {"addr": address, "start": start.isoformat(), "stop": stop.isoformat()},
+    )
+
+    rewards = cur.fetchall()
+    for r in rewards:
+        tmp = dict()
+        tmp["hash"] = r[0]
+        tmp["timestamp"] = r[1]
+        tmp["gateway"] = r[2]
+        tmp["block"] = r[3]
+        tmp["amount"] = r[4]
+        ret.append(tmp)
+
+    return ret
+
+
+def _db_reward_put(hash, ts, address, block, amount):
+    """
+    Save a daily reward total to the db. Does not yet handle errors like an
+    existin record
+    """
+    cur = _DB.cursor()
+    cur.execute(
+        "INSERT INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
+        {"hash": hash, "ts": ts, "addr": address, "block": block, "amt": amount},
     )
     _DB.commit()
 
@@ -122,7 +175,6 @@ def oracle_price_at_block(block):
     if ret is None:
         url = f"{API_URL}/oracle/prices/{block}"
         ret = _api_request(url)["price"]
-
         _db_oracle_put(block, ret)
         log.debug(f"Lookup price for block {block} is {ret}")
     else:
@@ -143,14 +195,28 @@ def hotspot_earnings(address, start, stop):
     were found.
     """
     ret = []
+
+    cached_rewards = _db_reward_fetch(address, start, stop)
+    log.debug(f"Got {len(cached_rewards)} cached rewards from DB")
+    if len(cached_rewards) > 0:
+        cached_max_ts = max([r["timestamp"] for r in cached_rewards])
+        # Bump the time just past the cached value
+        start = dateparse(cached_max_ts) + timedelta(milliseconds=1)
+
     url = f"{API_URL}/hotspots/{address}/rewards"
     params = dict()
-    params["max_time"] = stop
-    params["min_time"] = start
-
+    params["max_time"] = stop.isoformat()
+    params["min_time"] = start.isoformat()
     try:
-        ret = _api_request(url, params)
+        fetched_rewards = _api_request(url, params)
+        # Weed out duplicate hashes from the fetched list
+        cached_hashes = [cr["hash"] for cr in cached_rewards]
+        fetched_rewards = [x for x in fetched_rewards if not x["hash"] in cached_hashes]
+        for r in fetched_rewards:
+            _db_reward_put(r["hash"], r["timestamp"], address, r["block"], r["amount"])
     except:
         pass
 
+    ret.extend(cached_rewards)
+    ret.extend(fetched_rewards)
     return ret
