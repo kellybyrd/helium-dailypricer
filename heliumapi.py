@@ -48,7 +48,7 @@ def _daterange(start_date, end_date):
         yield start_date + timedelta(n)
 
 
-def _api_request(url, query_params={}):
+def _api_request(url, query_params=dict()):
     """
     Takes a helium api URL which returns JSON and may have paged results as
     described in the "Cursors" section here:
@@ -131,7 +131,7 @@ def _db_reward_fetch(address, start, stop):
     Returns:
     A list of reward records
     """
-    ret = []
+    ret = list()
     cur = _DB.cursor()
     cur.execute(
         "SELECT hash, timestamp, address, block, amount FROM DailyRewards "
@@ -160,11 +160,36 @@ def _db_reward_put(hash, ts, address, block, amount):
     existin record
     """
     cur = _DB.cursor()
+    # There's a constraint on hash, but code that calls this intentionally overlaps
+    # the times it fetches from the API with time should be in the DB in order to be
+    # sure it doesn't miss anything. We're using REPLACE here so we can be lazy and
+    # not deal with CONSTRAINT viloations.
     cur.execute(
-        "INSERT INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
+        "REPLACE INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
         {"hash": hash, "ts": ts, "addr": address, "block": block, "amt": amount},
     )
     _DB.commit()
+
+
+def _db_reward_max_min(address):
+    """
+    Given an address, get the oldest and newest reward timestamps.
+    """
+    ts_min = None
+    ts_max = None
+
+    cur = _DB.cursor()
+    cur.execute("SELECT MIN(timestamp) FROM DailyRewards;")
+    result = cur.fetchone()[0]
+    if result is not None:
+        ts_min = dateparse(result)
+
+    cur.execute("SELECT MAX(timestamp) FROM DailyRewards;")
+    result = cur.fetchone()[0]
+    if result is not None:
+        ts_max = dateparse(result)
+
+    return (ts_min, ts_max)
 
 
 def oracle_price_at_block(block):
@@ -183,6 +208,25 @@ def oracle_price_at_block(block):
     return ret
 
 
+def _api_reward_fetch(address, start, stop):
+    # Handle paged results and put items in the DB
+    ret = list()
+    url = f"{API_URL}/hotspots/{address}/rewards"
+    params = dict()
+    params["max_time"] = stop.isoformat()
+    params["min_time"] = start.isoformat()
+    try:
+        ret = _api_request(url, params)
+    except:
+        pass
+
+    log.debug(f"_api_reward_fetch: putting {len(ret)} records in the DB")
+    for r in ret:
+        _db_reward_put(r["hash"], r["timestamp"], address, r["block"], r["amount"])
+
+    return ret
+
+
 def hotspot_earnings(address, start, stop):
     """
     Get all earnings [start, end) for the given hotspot
@@ -194,29 +238,33 @@ def hotspot_earnings(address, start, stop):
     Will return an empty list if the address is not found or no earnings
     were found.
     """
-    ret = []
+    ONE_SEC = timedelta(
+        seconds=1
+    )  # Added to API fetch times to ensure we overlap a bit
 
-    cached_rewards = _db_reward_fetch(address, start, stop)
-    log.debug(f"Got {len(cached_rewards)} cached rewards from DB")
-    if len(cached_rewards) > 0:
-        cached_max_ts = max([r["timestamp"] for r in cached_rewards])
-        # Bump the time just past the cached value
-        start = dateparse(cached_max_ts) + timedelta(milliseconds=1)
+    # The overall strategy is to ensure no holes in the date range of the db cache.
+    # To do this we always try to extend the cache, even if the start/stop params do
+    # not overlap with the cached data.
+    # * Get db_min and db_max
+    # * If start < db_min: api_fetch for start to db_min(+1sec)
+    #   Insert these into db. At this point db range is start to db_max
+    # * If stop > db_max: api_fetch for db_max(-1sec) to stop
+    #   Insert these into db. At this point db range will be at least start to stop.
+    # * Read start to stop from DB
+    (db_min_ts, db_max_ts) = _db_reward_max_min(address)
+    if db_min_ts is None:
+        # Nothing in the DB yet
+        log.debug(f"DB: empty")
+        _api_reward_fetch(address, start, stop)
+    else:
+        if start < db_min_ts:
+            # Need data earlier than range in db
+            log.debug(f"DB: fetch before")
+            _api_reward_fetch(address, start, db_min_ts + ONE_SEC)
+        if stop > db_max_ts:
+            # Need data later than range in db
+            log.debug(f"DB: fetch after")
+            _api_reward_fetch(address, db_max_ts - ONE_SEC, stop)
 
-    url = f"{API_URL}/hotspots/{address}/rewards"
-    params = dict()
-    params["max_time"] = stop.isoformat()
-    params["min_time"] = start.isoformat()
-    try:
-        fetched_rewards = _api_request(url, params)
-        # Weed out duplicate hashes from the fetched list
-        cached_hashes = [cr["hash"] for cr in cached_rewards]
-        fetched_rewards = [x for x in fetched_rewards if not x["hash"] in cached_hashes]
-        for r in fetched_rewards:
-            _db_reward_put(r["hash"], r["timestamp"], address, r["block"], r["amount"])
-    except:
-        pass
-
-    ret.extend(cached_rewards)
-    ret.extend(fetched_rewards)
-    return ret
+    # The DB now covers the time range we need, so fetch it from there.
+    return _db_reward_fetch(address, start, stop)
