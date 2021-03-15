@@ -154,6 +154,37 @@ def _db_reward_fetch(address, start, stop):
     return ret
 
 
+def _db_reward_put_many(address, rewards):
+    """
+    Save a several reward records to the DB.
+
+    I probably should be doing this with executemany(), but it felt like transforming
+    a large rewards list-of-dicts into a list of properly ordered tuples was as much
+    work as calling execute() a bunch between commit()
+    """
+    # Break rows up into chunks of 50 rows. See:
+    # https://stackoverflow.com/questions/312443/how-do-you-split-a-list-into-evenly-sized-chunks
+    CHUNK_SIZE = 50
+    chunks = [rewards[i:i + CHUNK_SIZE] for i in range(0, len(rewards), CHUNK_SIZE)]
+    cur = _DB.cursor()
+
+    for chunk in chunks:
+        # There's a constraint on hash, but code that calls this intentionally overlaps
+        # the times it fetches from the API with time should be in the DB in order to be
+        # sure it doesn't miss anything. We're using REPLACE here so we can be lazy and
+        # not deal with CONSTRAINT viloations.
+        log.debug(f"chunk")
+        for r in chunk:
+            log.debug(f"r")
+            cur.execute(
+                "REPLACE INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
+                {"hash": r["hash"], "ts": r["timestamp"], "addr": address, "block": r["block"],
+                "amt": r["amount"]},
+            )
+        # commit per chunk, not per execute.
+        _DB.commit()
+
+
 def _db_reward_put(hash, ts, address, block, amount):
     """
     Save a daily reward total to the db. Does not yet handle errors like an
@@ -221,8 +252,7 @@ def _api_reward_fetch(address, start, stop):
         pass
 
     log.debug(f"_api_reward_fetch: putting {len(ret)} records in the DB")
-    for r in ret:
-        _db_reward_put(r["hash"], r["timestamp"], address, r["block"], r["amount"])
+    _db_reward_put_many(address, ret)
 
     return ret
 
