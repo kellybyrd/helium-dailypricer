@@ -173,9 +173,7 @@ def _db_reward_put_many(address, rewards):
         # the times it fetches from the API with time should be in the DB in order to be
         # sure it doesn't miss anything. We're using REPLACE here so we can be lazy and
         # not deal with CONSTRAINT viloations.
-        log.debug(f"chunk")
         for r in chunk:
-            log.debug(f"r")
             cur.execute(
                 "REPLACE INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
                 {"hash": r["hash"], "ts": r["timestamp"], "addr": address, "block": r["block"],
@@ -210,12 +208,14 @@ def _db_reward_max_min(address):
     ts_max = None
 
     cur = _DB.cursor()
-    cur.execute("SELECT MIN(timestamp) FROM DailyRewards;")
+    cur.execute("SELECT MIN(timestamp) FROM DailyRewards WHERE address=:addr;",
+                {"addr": address})
     result = cur.fetchone()[0]
     if result is not None:
         ts_min = dateparse(result)
 
-    cur.execute("SELECT MAX(timestamp) FROM DailyRewards;")
+    cur.execute("SELECT MAX(timestamp) FROM DailyRewards WHERE address=:addr;",
+                {"addr": address})
     result = cur.fetchone()[0]
     if result is not None:
         ts_max = dateparse(result)
