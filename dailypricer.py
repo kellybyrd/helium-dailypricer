@@ -66,7 +66,7 @@ def _arg_valid_date(s):
 def _write_csv(data):
     writer = csv.writer(sys.stdout, dialect="unix")
     writer.writerow(["date", "hnt", "price"])
-    for date, v in sorted(data.items()):
+    for date, v in sorted(data.items(), reverse=True):
         writer.writerow((date, v["hnt"], v["price"]))
 
 
