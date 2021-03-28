@@ -1,8 +1,10 @@
 import atexit
 import json
 import logging
+import math
 import sqlite3
-from datetime import datetime, timedelta
+import statistics
+from datetime import date, datetime, timedelta
 
 import requests
 from dateutil.parser import parse as dateparse
@@ -24,18 +26,18 @@ def _close_db():
 _DB = sqlite3.connect(_DB_FILE)
 cur = _DB.cursor()
 cur.execute(
-    "CREATE TABLE IF NOT EXISTS OraclePrices "
-    "(block INTEGER PRIMARY KEY, "
-    "price INTEGER DEFAULT 0);"
+    "CREATE TABLE IF NOT EXISTS OraclePrices ("
+    "block INTEGER PRIMARY KEY, "
+    "timestamp TEXT NOT NULL, "
+    "price_bones INTEGER DEFAULT 0);"
 )
 
 cur.execute(
     "CREATE TABLE IF NOT EXISTS DailyRewards ("
-    "hash TEXT PRIMARY KEY, "
     "timestamp TEXT NOT NULL, "
     "address TEXT NOT NULL, "
-    "block INTEGER NOT NULL, "
-    "amount INTEGER NOT NULL "
+    "sum_bones INTEGER NOT NULL, "
+    "UNIQUE(timestamp, address) "
     ");"
 )
 
@@ -95,38 +97,153 @@ def _api_request(url, query_params=dict()):
     return ret
 
 
-def _db_oracle_fetch(block):
+def _cache_oracle_prices(until_ts=None):
     """
-    Lookup the Oracle price from the db
+    A copy of _api_request() that stops paging at until_ts and also
+    saves each page to the DB as it goes.
 
-    Returns:
-    price in bones or None if it isn't in the db
+    Returns
+    List of dicts from merged results.
+
+    Note: This assumes all the repsonse json has "data" and optionally
+          "cursor" top level keys. So far has been true
     """
-    cur = _DB.cursor()
-    cur.execute("SELECT price FROM OraclePrices WHERE block=:block", {"block": block})
-    ret = cur.fetchone()
-    if ret is not None:
-        ret = ret[0]
+
+    # TODO: Factor this and _api_request out into some common bit.
+    ret = list()
+    cursor = None
+    query_params = {}
+    url = f"{API_URL}//oracle/prices"
+
+    if until_ts is None:
+        until_ts = datetime.min
+
+    # repeat-until cursor is None or until_block is reached
+    while True:
+        if cursor is not None:
+            query_params["cursor"] = cursor
+        try:
+            resp = requests.get(url, params=query_params)
+            resp.raise_for_status()
+            json = resp.json()
+            data = json.get("data")
+            if type(data) is list:
+                ret.extend(data)
+                _db_price_put_many(data)
+                min_ts = dateparse(min(data, key=lambda x: x["timestamp"])["timestamp"])
+                log.debug(f"Oracle min_ts is now {min_ts}")
+                if min_ts <= until_ts:
+                    log.debug(
+                        f"Not continuing because found block {min_ts} is "
+                        f"lower than {until_ts}"
+                    )
+                    cursor = None
+                else:
+                    cursor = json.get("cursor")
+                    log.debug(f"New cursor is : {cursor}")
+            else:
+                # Not a JSON array, so not a paged result
+                ret = data
+                cursor = None
+
+        except Exception as ex:
+            log.error(f"Error: {ex}")
+            # This will break us out of the while loop
+            cursor = None
+
+        if cursor is None:
+            break
 
     return ret
 
 
-def _db_oracle_put(block, price):
+def _db_price_at_time(as_of_time):
+    """
+    Give the most recent Oracle prices record right before as_of_time, this will be the
+    effective price at that timestamps
+
+    Returns:
+    A DB record containing the price
+    """
+
+    ret = dict()
+    cur = _DB.cursor()
+    cur.execute(
+        "SELECT block, max(timestamp), price_bones FROM OraclePrices WHERE timestamp <= :time ",
+        {"time": as_of_time},
+    )
+    price = cur.fetchone()
+
+    ret["block"] = price[0]
+    ret["timestamp"] = price[1]
+    ret["price"] = price[2]
+
+    return ret
+
+
+def _db_price_put_many(prices):
+    """
+    Save a several reward records to the DB.
+
+    I probably should be doing this with executemany(), but it felt like transforming
+    a large rewards list-of-dicts into a list of properly ordered tuples was as much
+    work as calling execute() a bunch between commit()
+    """
+    # Break rows up into chunks of 50 rows. See:
+    # https://stackoverflow.com/questions/312443/how-do-you-split-a-list-into-evenly-sized-chunks
+    CHUNK_SIZE = 50
+    chunks = [prices[i : i + CHUNK_SIZE] for i in range(0, len(prices), CHUNK_SIZE)]
+    cur = _DB.cursor()
+
+    for chunk in chunks:
+        # There's a constraint on block, but code that calls this gets blocks from the
+        # API that are already in the DB. We're using REPLACE here so we can be lazy and
+        # not deal with CONSTRAINT violations.
+        for r in chunk:
+            cur.execute(
+                "REPLACE INTO OraclePrices VALUES (:block, :timestamp, :price_bones)",
+                {
+                    "block": r["block"],
+                    "timestamp": r["timestamp"],
+                    "price_bones": r["price"],
+                },
+            )
+        # commit per chunk, not per execute.
+        _DB.commit()
+
+
+def _db_price_put(block, timestamp, price):
     """
     Save an Oracle price to the db. Does not yet handle errors like an existing
     record
     """
     cur = _DB.cursor()
     cur.execute(
-        "INSERT INTO OraclePrices VALUES (:block, :price)",
-        {"block": block, "price": price},
+        "INSERT INTO OraclePrices VALUES (:block, :timestamp, :price)",
+        {"block": block, "timestamp": timestamp, "price_bones": price},
     )
     _DB.commit()
 
 
+def _db_price_max_time():
+    """
+    Get the timestamp of the most recent oracle price in the DB
+    """
+    ret = None
+
+    cur = _DB.cursor()
+    cur.execute("SELECT MAX(timestamp) FROM OraclePrices;")
+    result = cur.fetchone()[0]
+    if result is not None:
+        ret = dateparse(result).date()
+
+    return ret
+
+
 def _db_reward_fetch(address, start, stop):
     """
-    TODO
+    Fetch rewards from the cache filling of the cache from the REST API
+    if needed.
 
     Returns:
     A list of reward records
@@ -134,8 +251,8 @@ def _db_reward_fetch(address, start, stop):
     ret = list()
     cur = _DB.cursor()
     cur.execute(
-        "SELECT hash, timestamp, address, block, amount FROM DailyRewards "
-        "WHERE  address=:addr AND "
+        "SELECT timestamp, address, sum_bones FROM DailyRewards "
+        "WHERE address=:addr AND "
         "timestamp BETWEEN :start AND :stop "
         "ORDER BY timestamp ASC;",
         {"addr": address, "start": start.isoformat(), "stop": stop.isoformat()},
@@ -144,11 +261,9 @@ def _db_reward_fetch(address, start, stop):
     rewards = cur.fetchall()
     for r in rewards:
         tmp = dict()
-        tmp["hash"] = r[0]
-        tmp["timestamp"] = r[1]
-        tmp["gateway"] = r[2]
-        tmp["block"] = r[3]
-        tmp["amount"] = r[4]
+        tmp["timestamp"] = r[0]
+        tmp["address"] = r[1]
+        tmp["sum"] = r[2]
         ret.append(tmp)
 
     return ret
@@ -165,7 +280,7 @@ def _db_reward_put_many(address, rewards):
     # Break rows up into chunks of 50 rows. See:
     # https://stackoverflow.com/questions/312443/how-do-you-split-a-list-into-evenly-sized-chunks
     CHUNK_SIZE = 50
-    chunks = [rewards[i:i + CHUNK_SIZE] for i in range(0, len(rewards), CHUNK_SIZE)]
+    chunks = [rewards[i : i + CHUNK_SIZE] for i in range(0, len(rewards), CHUNK_SIZE)]
     cur = _DB.cursor()
 
     for chunk in chunks:
@@ -175,18 +290,21 @@ def _db_reward_put_many(address, rewards):
         # not deal with CONSTRAINT viloations.
         for r in chunk:
             cur.execute(
-                "REPLACE INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
-                {"hash": r["hash"], "ts": r["timestamp"], "addr": address, "block": r["block"],
-                "amt": r["amount"]},
+                "REPLACE INTO DailyRewards VALUES (:timestamp, :address, :sum_bones)",
+                {
+                    "timestamp": r["timestamp"],
+                    "address": address,
+                    "sum_bones": r["sum"],
+                },
             )
         # commit per chunk, not per execute.
         _DB.commit()
 
 
-def _db_reward_put(hash, ts, address, block, amount):
+def _db_reward_put(timestamp, address, sum_bones):
     """
     Save a daily reward total to the db. Does not yet handle errors like an
-    existin record
+    existing record
     """
     cur = _DB.cursor()
     # There's a constraint on hash, but code that calls this intentionally overlaps
@@ -194,8 +312,8 @@ def _db_reward_put(hash, ts, address, block, amount):
     # sure it doesn't miss anything. We're using REPLACE here so we can be lazy and
     # not deal with CONSTRAINT viloations.
     cur.execute(
-        "REPLACE INTO DailyRewards VALUES (:hash, :ts, :addr, :block, :amt)",
-        {"hash": hash, "ts": ts, "addr": address, "block": block, "amt": amount},
+        "REPLACE INTO DailyRewards VALUES (:timestamp, :address, :sum_bones)",
+        {"timestamp": timestamp, "address": address, "sum_bones": sum_bones},
     )
     _DB.commit()
 
@@ -208,44 +326,33 @@ def _db_reward_max_min(address):
     ts_max = None
 
     cur = _DB.cursor()
-    cur.execute("SELECT MIN(timestamp) FROM DailyRewards WHERE address=:addr;",
-                {"addr": address})
+    cur.execute(
+        "SELECT MIN(timestamp) FROM DailyRewards WHERE address=:address;",
+        {"address": address},
+    )
     result = cur.fetchone()[0]
     if result is not None:
-        ts_min = dateparse(result)
-
-    cur.execute("SELECT MAX(timestamp) FROM DailyRewards WHERE address=:addr;",
-                {"addr": address})
+        ts_min = dateparse(result).date()
+    cur.execute(
+        "SELECT MAX(timestamp) FROM DailyRewards WHERE address=:address;",
+        {"address": address},
+    )
     result = cur.fetchone()[0]
     if result is not None:
-        ts_max = dateparse(result)
+        ts_max = dateparse(result).date()
 
     return (ts_min, ts_max)
-
-
-def oracle_price_at_block(block):
-    """
-    Return the Helium API oracle price in bones at a given block
-    """
-    ret = _db_oracle_fetch(block)
-    if ret is None:
-        url = f"{API_URL}/oracle/prices/{block}"
-        ret = _api_request(url)["price"]
-        _db_oracle_put(block, ret)
-        log.debug(f"Lookup price for block {block} is {ret}")
-    else:
-        log.debug(f"Cached price for block {block} is {ret}")
-
-    return ret
 
 
 def _api_reward_fetch(address, start, stop):
     # Handle paged results and put items in the DB
     ret = list()
-    url = f"{API_URL}/hotspots/{address}/rewards"
+    url = f"{API_URL}/hotspots/{address}/rewards/sum"
     params = dict()
     params["max_time"] = stop.isoformat()
     params["min_time"] = start.isoformat()
+    params["bucket"] = "day"
+
     try:
         ret = _api_request(url, params)
     except:
@@ -253,6 +360,36 @@ def _api_reward_fetch(address, start, stop):
 
     log.debug(f"_api_reward_fetch: putting {len(ret)} records in the DB")
     _db_reward_put_many(address, ret)
+
+    return ret
+
+
+def oracle_price_for_day(day):
+    """
+    Return the closing Helium oracle price for a given day. This is the Oracle price
+    at just before midnight the next day. Ex:
+      If day is 2021-03-27, we will return the price as of '2021-03-27T23:59:59.999Z'
+    """
+    END_OF_DAY = timedelta(days=2, microseconds=-1)
+
+    # The oracle price API doesn't take a time range. It is a paged result of
+    # JSON objects in what appears to be descending timestamp order.
+    #
+    # The overall strategy is to get the most recent block in the DB, then fetch
+    # from the API, paging thru results until we reach that max DB block. Then
+    # put these results in the DB. The net result is we end of with all oracle
+    # prices from the beginning of time, and then keep adding new prices every
+    # time this is called, ensuring no time gaps in the DB.
+    #
+    db_max_ts = _db_price_max_time()
+    if day > db_max_ts:
+        log.debug(f"Fetching Oracle prices since {db_max_ts}")
+        _cache_oracle_prices(db_max_ts)
+
+    # The DB now covers the time range we need, so fetch prices from there.
+    ret = _db_price_at_time(day + END_OF_DAY)["price"]
+    if ret is None:
+        ret = 0
 
     return ret
 
@@ -284,16 +421,16 @@ def hotspot_earnings(address, start, stop):
     (db_min_ts, db_max_ts) = _db_reward_max_min(address)
     if db_min_ts is None:
         # Nothing in the DB yet
-        log.debug(f"DB: empty")
+        log.debug(f"DB: rewards empty")
         _api_reward_fetch(address, start, stop)
     else:
         if start < db_min_ts:
             # Need data earlier than range in db
-            log.debug(f"DB: fetch before")
+            log.debug(f"DB: rewards fetch before")
             _api_reward_fetch(address, start, db_min_ts + ONE_SEC)
         if stop > db_max_ts:
             # Need data later than range in db
-            log.debug(f"DB: fetch after")
+            log.debug(f"DB: rewards fetch after")
             _api_reward_fetch(address, db_max_ts - ONE_SEC, stop)
 
     # The DB now covers the time range we need, so fetch it from there.

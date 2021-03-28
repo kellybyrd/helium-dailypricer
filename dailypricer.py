@@ -5,7 +5,7 @@ import csv
 import logging
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from dateutil.parser import parse as dateparse
 
@@ -34,19 +34,20 @@ def _hotspot_earnings_daily(address, start, stop):
     Will return an empty dict if the address is not found or no earnings
     were found.
     """
+    log.debug(f"Getting data for {address} from {start} to {stop}")
     ret = defaultdict(lambda: {"hnt": 0.0, "usd": 0.0}, key=str)
     rewards = api.hotspot_earnings(address, start, stop)
 
     # Convert 'timestamp' from an ISO8601 string to a datetime then "truncate"
-    # to a datetime.date(), using this as a key and the subtotalling daily
-    # rewards and their USD equivalent.
+    # to a datetime.date(), using this as the key, filling in HNT and daily price
+    # in the value dict
     for r in rewards:
         day = dateparse(r["timestamp"]).date()
-        bones = r["amount"]
+        bones = r["sum"]
         hnt = bones / api.BONES_PER_HNT
-        price = api.oracle_price_at_block(r["block"]) / api.BONES_PER_HNT
-        ret[day]["hnt"] += hnt
-        ret[day]["usd"] += price * hnt
+        price = api.oracle_price_for_day(day) / api.BONES_PER_HNT
+        ret[day]["hnt"] = hnt
+        ret[day]["price"] = price
 
     del ret["key"]
     return ret
@@ -54,21 +55,19 @@ def _hotspot_earnings_daily(address, start, stop):
 
 def _arg_valid_date(s):
     try:
-        dt = dateparse(s)
-        if dt.tzinfo is None:
-            dt = dt.astimezone()
-
-        return dt
-    except ValueError:
-        msg = "Not a valid iso8601 datetime: '{0}'.".format(s)
+        day = date.fromisoformat(s)
+        return day
+    except Exception as e:
+        msg = f"Not a valid iso8601 date: '{s}'. Must be in YYYY-MM-DD"
+        log.error(e)
         raise argparse.ArgumentTypeError(msg)
 
 
 def _write_csv(data):
     writer = csv.writer(sys.stdout, dialect="unix")
-    writer.writerow(["date", "hnt", "usd"])
+    writer.writerow(["date", "hnt", "price"])
     for date, v in sorted(data.items()):
-        writer.writerow((date, v["hnt"], v["usd"]))
+        writer.writerow((date, v["hnt"], v["price"]))
 
 
 def main():
@@ -82,15 +81,15 @@ def main():
 
     parser.add_argument(
         "--start",
-        help="Begining of time range as iso8601 string. Defaults to yesterday.",
-        default=(today - timedelta(days=1)).isoformat(),
+        help="Begining of time range as iso8601 date string in UTC. Defaults to yesterday.",
+        default=(today - timedelta(days=1)).date().isoformat(),
         type=_arg_valid_date,
     )
     parser.add_argument(
         "--stop",
-        help="End of time range as iso8601 string. Defaults to today.",
+        help="End of time range as iso8601 date string in UTC. Defaults to today.",
         required=False,
-        default=today.isoformat(),
+        default=today.date().isoformat(),
         type=_arg_valid_date,
     )
 
@@ -100,5 +99,5 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     main()
