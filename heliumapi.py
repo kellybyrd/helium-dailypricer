@@ -4,12 +4,15 @@ import logging
 import math
 import sqlite3
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from dateutil.parser import parse as dateparse
 
 log = logging.getLogger(__name__)
+
+HELIUM_BLOCKCHAIN_START = datetime.fromisoformat("2017-07-29T00:00:00")
+HELIUM_ORACLE_START = datetime.fromisoformat("2020-06-10T00:00:00")
 
 BONES_PER_HNT = 100000000
 API_URL = "https://api.helium.io/v1"
@@ -97,64 +100,24 @@ def _api_request(url, query_params=dict()):
     return ret
 
 
-def _cache_oracle_prices(until_ts=None):
-    """
-    A copy of _api_request() that stops paging at until_ts and also
-    saves each page to the DB as it goes.
+def _cache_oracle_price(ts=None):
+    block_url = f"{API_URL}/blocks/height"
+    block_params = dict()
+    block_params["max_time"] = ts.isoformat()
 
-    Returns
-    List of dicts from merged results.
-
-    Note: This assumes all the repsonse json has "data" and optionally
-          "cursor" top level keys. So far has been true
-    """
-
-    # TODO: Factor this and _api_request out into some common bit.
-    ret = list()
-    cursor = None
-    query_params = {}
-    url = f"{API_URL}//oracle/prices"
-
-    if until_ts is None:
-        until_ts = datetime.min
-
-    # repeat-until cursor is None or until_block is reached
-    while True:
-        if cursor is not None:
-            query_params["cursor"] = cursor
-        try:
-            resp = requests.get(url, params=query_params)
-            resp.raise_for_status()
-            json = resp.json()
-            data = json.get("data")
-            if type(data) is list:
-                ret.extend(data)
-                _db_price_put_many(data)
-                min_ts = dateparse(min(data, key=lambda x: x["timestamp"])["timestamp"])
-                log.debug(f"Oracle min_ts is now {min_ts}")
-                if min_ts <= until_ts:
-                    log.debug(
-                        f"Not continuing because found block {min_ts} is "
-                        f"lower than {until_ts}"
-                    )
-                    cursor = None
-                else:
-                    cursor = json.get("cursor")
-                    log.debug(f"New cursor is : {cursor}")
-            else:
-                # Not a JSON array, so not a paged result
-                ret = data
-                cursor = None
-
-        except Exception as ex:
-            log.error(f"Error: {ex}")
-            # This will break us out of the while loop
-            cursor = None
-
-        if cursor is None:
-            break
-
-    return ret
+    try:
+        log.debug(f"_cache_oracle_price: fetching block for {ts}")
+        ret = _api_request(block_url, block_params)
+        log.debug(f"_cache_oracle_price: ret {ret}")
+        block_num = ret["height"]
+        log.debug(f"_cache_oracle_price: fetching price for {block_num}")
+        price_url = f"{API_URL}/oracle/prices/{block_num}"
+        price_result = _api_request(price_url, None)
+        log.debug(f"_cache_oracle_price: caching price {price_result}")
+        _db_price_put(price_result["block"], ts, price_result["price"])
+    except Exception as ex:
+        log.error(f"_cache_oracle_price: Error: {ex}")
+        pass
 
 
 def _db_price_at_time(as_of_time):
@@ -165,14 +128,16 @@ def _db_price_at_time(as_of_time):
     Returns:
     A DB record containing the price
     """
+    log.debug(f"_db_price_at_time: looking up record for {as_of_time}")
 
     ret = dict()
     cur = _DB.cursor()
     cur.execute(
-        "SELECT block, max(timestamp), price_bones FROM OraclePrices WHERE timestamp <= :time ",
+        "SELECT block, max(timestamp), price_bones FROM OraclePrices WHERE timestamp = :time ",
         {"time": as_of_time},
     )
     price = cur.fetchone()
+    log.debug(f"_db_price_at_time: found {price}")
 
     ret["block"] = price[0]
     ret["timestamp"] = price[1]
@@ -219,7 +184,7 @@ def _db_price_put(block, timestamp, price):
     """
     cur = _DB.cursor()
     cur.execute(
-        "INSERT INTO OraclePrices VALUES (:block, :timestamp, :price)",
+        "REPLACE INTO OraclePrices VALUES (:block, :timestamp, :price_bones)",
         {"block": block, "timestamp": timestamp, "price_bones": price},
     )
     _DB.commit()
@@ -370,27 +335,30 @@ def oracle_price_for_day(day):
     at just before midnight the next day. Ex:
       If day is 2021-03-27, we will return the price as of '2021-03-27T23:59:59.999Z'
     """
-    END_OF_DAY = timedelta(days=2, microseconds=-1)
-
-    # The oracle price API doesn't take a time range. It is a paged result of
-    # JSON objects in what appears to be descending timestamp order.
+    END_OF_DAY = timedelta(days=1, microseconds=-1)
+    # The oracle price API doesn't take a time range. It takes a block
     #
-    # The overall strategy is to get the most recent block in the DB, then fetch
-    # from the API, paging thru results until we reach that max DB block. Then
-    # put these results in the DB. The net result is we end of with all oracle
-    # prices from the beginning of time, and then keep adding new prices every
-    # time this is called, ensuring no time gaps in the DB.
-    #
-    db_max_ts = _db_price_max_time()
-    if day > db_max_ts:
-        log.debug(f"Fetching Oracle prices since {db_max_ts}")
-        _cache_oracle_prices(db_max_ts)
+    # We can now look up a block for a given time, then look up oracle price for
+    # that block. So, first try the DB for this timestamp
+    ts = datetime.combine(day, datetime.min.time()) + END_OF_DAY
 
-    # The DB now covers the time range we need, so fetch prices from there.
-    ret = _db_price_at_time(day + END_OF_DAY)["price"]
+    # All prices before the start of the oracles are 0
+    if ts < HELIUM_ORACLE_START:
+        return 0
+
+    log.debug(f"oracle_price_for_day: Looking in DB for price at {ts}")
+    ret = _db_price_at_time(ts)["price"]
     if ret is None:
+        log.debug(f"oracle_price_for_day: {ts} Not found in DB, fetching")
+        _cache_oracle_price(ts)
+        log.debug(f"oracle_price_for_day: {ts} fetched, looking up again")
+    ret = _db_price_at_time(ts)["price"]
+    log.debug(f"oracle_price_for_day: ret {ret} in db")
+    if ret is None:
+        log.debug(f"oracle_price_for_day: ret is none returning 0")
         ret = 0
 
+    log.debug(f"oracle_price_for_day: returning {ret}")
     return ret
 
 
@@ -405,6 +373,10 @@ def hotspot_earnings(address, start, stop):
     Will return an empty list if the address is not found or no earnings
     were found.
     """
+
+    # Don't bother with earnings before the start of the chain
+    start = max(start, HELIUM_BLOCKCHAIN_START.date())
+
     ONE_SEC = timedelta(
         seconds=1
     )  # Added to API fetch times to ensure we overlap a bit

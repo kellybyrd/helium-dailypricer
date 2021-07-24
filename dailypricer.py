@@ -44,10 +44,11 @@ def _hotspot_earnings_daily(address, start, stop):
     for r in rewards:
         day = dateparse(r["timestamp"]).date()
         bones = r["sum"]
-        hnt = bones / api.BONES_PER_HNT
-        price = api.oracle_price_for_day(day) / api.BONES_PER_HNT
-        ret[day]["hnt"] = hnt
-        ret[day]["price"] = price
+        if bones > 0:
+            hnt = bones / api.BONES_PER_HNT
+            price = api.oracle_price_for_day(day) / api.BONES_PER_HNT
+            ret[day]["hnt"] = hnt
+            ret[day]["price"] = price
 
     del ret["key"]
     return ret
