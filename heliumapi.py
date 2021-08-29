@@ -318,6 +318,7 @@ def _api_reward_fetch(address, start, stop):
     params["min_time"] = start.isoformat()
     params["bucket"] = "day"
 
+    log.debug(f"_api_request: {url} {params}")
     try:
         ret = _api_request(url, params)
     except:
@@ -393,16 +394,16 @@ def hotspot_earnings(address, start, stop):
     (db_min_ts, db_max_ts) = _db_reward_max_min(address)
     if db_min_ts is None:
         # Nothing in the DB yet
-        log.debug(f"DB: rewards empty")
+        log.debug(f"DB: rewards empty {start} - {stop} ")
         _api_reward_fetch(address, start, stop)
     else:
         if start < db_min_ts:
             # Need data earlier than range in db
-            log.debug(f"DB: rewards fetch before")
+            log.debug(f"DB: rewards fetch before {start} - {db_min_ts + ONE_SEC}")
             _api_reward_fetch(address, start, db_min_ts + ONE_SEC)
         if stop > db_max_ts:
             # Need data later than range in db
-            log.debug(f"DB: rewards fetch after")
+            log.debug(f"DB: rewards fetch after {db_max_ts - ONE_SEC} - {stop}")
             _api_reward_fetch(address, db_max_ts - ONE_SEC, stop)
 
     # The DB now covers the time range we need, so fetch it from there.
