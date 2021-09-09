@@ -56,10 +56,12 @@ def _hotspot_earnings_daily(address, start, stop):
 
 def _arg_valid_date(s):
     try:
+        today = datetime.now().astimezone().date()
         day = date.fromisoformat(s)
-        return day
+        return day if day < today else today
     except Exception as e:
-        msg = f"Not a valid iso8601 date: '{s}'. Must be in YYYY-MM-DD"
+        msg = f"Not a valid iso8601 date: '{s}'. Must be in YYYY-MM-DD format. "
+        "an no later than today"
         log.error(e)
         raise argparse.ArgumentTypeError(msg)
 
@@ -88,7 +90,8 @@ def main():
     )
     parser.add_argument(
         "--stop",
-        help="End of time range as iso8601 date string in UTC. Defaults to today.",
+        help="End of time range as iso8601 date string in UTC. "
+        "Can be no later than today. Defaults to today.",
         required=False,
         default=today.date().isoformat(),
         type=_arg_valid_date,

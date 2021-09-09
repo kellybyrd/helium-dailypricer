@@ -292,14 +292,16 @@ def _db_reward_max_min(address):
 
     cur = _DB.cursor()
     cur.execute(
-        "SELECT MIN(timestamp) FROM DailyRewards WHERE address=:address;",
+        "SELECT MIN(timestamp) FROM DailyRewards "
+        "WHERE address=:address AND sum_bones > 0;",
         {"address": address},
     )
     result = cur.fetchone()[0]
     if result is not None:
         ts_min = dateparse(result).date()
     cur.execute(
-        "SELECT MAX(timestamp) FROM DailyRewards WHERE address=:address;",
+        "SELECT MAX(timestamp) FROM DailyRewards "
+        "WHERE address=:address and sum_bones > 0;",
         {"address": address},
     )
     result = cur.fetchone()[0]
