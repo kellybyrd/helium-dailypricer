@@ -90,7 +90,8 @@ def _api_request(url, query_params=dict()):
                 cursor = None
 
         except Exception as ex:
-            log.error(f"Error: {ex}")
+            # This is debug level because sometimes we intentionally expect 404
+            log.debug(f"Error: {ex}")
             # This will break us out of the while loop
             cursor = None
 
@@ -282,6 +283,19 @@ def _db_reward_put(timestamp, address, sum_bones):
     )
     _DB.commit()
 
+def is_validator(address):
+    """
+    Return true if the helium API thinks the address is a validator
+    """
+    url = f"{API_URL}/validators/{address}"
+    return True if _api_request(url, {}) else False
+
+def is_hotspot(address):
+    """
+    Return true if the helium API thinks the address is a hotspot
+    """
+    url = f"{API_URL}/hotspots/{address}"
+    return True if _api_request(url, {}) else False
 
 def _db_reward_max_min(address):
     """
@@ -314,7 +328,14 @@ def _db_reward_max_min(address):
 def _api_reward_fetch(address, start, stop):
     # Handle paged results and put items in the DB
     ret = list()
-    url = f"{API_URL}/hotspots/{address}/rewards/sum"
+    if is_validator(address):
+        url = f"{API_URL}/validators/{address}/rewards/sum"
+    elif is_hotspot(address):
+        url = f"{API_URL}/hotspots/{address}/rewards/sum"
+    else:
+        log.error(f"Address is not a hotspot or validator")
+        return ret
+
     params = dict()
     params["max_time"] = stop.isoformat()
     params["min_time"] = start.isoformat()
@@ -365,10 +386,9 @@ def oracle_price_for_day(day):
     return ret
 
 
-def hotspot_earnings(address, start, stop):
+def earnings(address, start, stop):
     """
-    Get all earnings [start, end) for the given hotspot
-    address.
+    Get all earnings [start, end) for the given hotspot/validator address.
 
     Returns
     A list of dicts, one dict for each reward.

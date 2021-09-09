@@ -22,10 +22,10 @@ def _daterange(start_date, end_date):
         yield start_date + timedelta(n)
 
 
-def _hotspot_earnings_daily(address, start, stop):
+def _earnings_daily(address, start, stop):
     """
-    Get daily subtotal for all earnings [start, end) for the given hotspot
-    address.
+    Get daily subtotal for all earnings [start, end) for the given hotspot or
+    validator address.
 
     Returns
     A dict of {"iso8601 date string" : daily subtotal in bones}, with one
@@ -36,7 +36,7 @@ def _hotspot_earnings_daily(address, start, stop):
     """
     log.debug(f"Getting data for {address} from {start} to {stop}")
     ret = defaultdict(lambda: {"hnt": 0.0, "usd": 0.0}, key=str)
-    rewards = api.hotspot_earnings(address, start, stop)
+    rewards = api.earnings(address, start, stop)
 
     # Convert 'timestamp' from an ISO8601 string to a datetime then "truncate"
     # to a datetime.date(), using this as the key, filling in HNT and daily price
@@ -98,7 +98,7 @@ def main():
     )
 
     args = parser.parse_args()
-    ret = _hotspot_earnings_daily(args.address, args.start, args.stop)
+    ret = _earnings_daily(args.address, args.start, args.stop)
     _write_csv(ret)
 
 
