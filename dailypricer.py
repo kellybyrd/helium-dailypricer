@@ -22,7 +22,7 @@ def _daterange(start_date, end_date):
         yield start_date + timedelta(n)
 
 
-def _earnings_daily(address, start, stop):
+def _earnings_daily(address, start, stop, useragent):
     """
     Get daily subtotal for all earnings [start, end) for the given hotspot or
     validator address.
@@ -36,7 +36,7 @@ def _earnings_daily(address, start, stop):
     """
     log.debug(f"Getting data for {address} from {start} to {stop}")
     ret = defaultdict(lambda: {"hnt": 0.0, "usd": 0.0}, key=str)
-    rewards = api.earnings(address, start, stop)
+    rewards = api.earnings(address, start, stop, useragent)
 
     # Convert 'timestamp' from an ISO8601 string to a datetime then "truncate"
     # to a datetime.date(), using this as the key, filling in HNT and daily price
@@ -46,7 +46,7 @@ def _earnings_daily(address, start, stop):
         bones = r["sum"]
         if bones > 0:
             hnt = bones / api.BONES_PER_HNT
-            price = api.oracle_price_for_day(day) / api.BONES_PER_HNT
+            price = api.oracle_price_for_day(day, useragent) / api.BONES_PER_HNT
             ret[day]["hnt"] = hnt
             ret[day]["price"] = price
 
@@ -97,8 +97,16 @@ def main():
         type=_arg_valid_date,
     )
 
+    parser.add_argument(
+        "--useragent",
+        help="Set a custom user-agent header when talking to the API. "
+        "Without this, the API provider my rate limit or block your requests.",
+        required=False,
+        type=str,
+    )
+
     args = parser.parse_args()
-    ret = _earnings_daily(args.address, args.start, args.stop)
+    ret = _earnings_daily(args.address, args.start, args.stop, args.useragent)
     _write_csv(ret)
 
 
